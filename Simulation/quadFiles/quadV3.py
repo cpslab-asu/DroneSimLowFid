@@ -1,4 +1,4 @@
-
+import pathlib
 
 import numpy as np
 from numpy import sin, cos, tan, pi, sign
@@ -20,7 +20,7 @@ K = 0  # Kalman gain
 Q = 8.9  # Process noise covariance
 R = 500 ** 2  # Measurement noise covariance
 estimated_pressure = None  # Initial estimated pressure
-excel_path = "/home/local/ASURITE/binxu4/Videos/Screencasts/output.xlsx"  # Change this to your actual file path
+excel_path = pathlib.Path(__file__).parent / "output.xlsx"  # Change this to your actual file path
 df = pd.read_excel(excel_path, header=None)  # Assuming no headers
 numerical_data = df.to_numpy()
 upsampled_data = np.repeat(numerical_data, 60, axis=0)

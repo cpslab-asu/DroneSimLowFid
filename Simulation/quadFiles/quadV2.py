@@ -1,4 +1,4 @@
-
+import pathlib
 
 import numpy as np
 from numpy import sin, cos, tan, pi, sign
@@ -20,7 +20,7 @@ K = 0  # Kalman gain
 Q = 0.9  # Process noise covariance
 R = 500 ** 2  # Measurement noise covariance
 estimated_pressure = None  # Initial estimated pressure
-file_path = '/home/local/ASURITE/binxu4/Desktop/Quadcopter_SimCon/Simulation/drone_rotor_intensity.xlsx'  # Replace with the path to your Excel file
+file_path = pathlib.Path(__file__).parent / "drone_rotor_intensity.xlsx"  # Find parameters file as sibling to this module
 df = pd.read_excel(file_path)
 
 
