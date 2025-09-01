@@ -25,6 +25,7 @@ numerical_data = df.to_numpy()
 upsampled_data = np.repeat(numerical_data, 60, axis=0)
 
 _logger = logging.getLogger("dronesim2.quad")
+_logger.addHandler(logging.NullHandler())
 
 
 
@@ -295,7 +296,7 @@ class Quadcopter:
             val = 8
         
         
-        _logger.debug("Measured Pressure: %d", measured_pressure)
+        _logger.debug("Measured Pressure: %.4f", measured_pressure)
         # Initialize estimated pressure if it's the first measurement
         if estimated_pressure is None:
             estimated_pressure = measured_pressure
@@ -331,7 +332,7 @@ class Quadcopter:
         #    self.state[2] = 0
             
             
-        _logger.debug("Altitude: %d", self.state[2])
+        _logger.debug("Altitude: %.4f", self.state[2])
         ### Rotor speed from an external source
         
 
