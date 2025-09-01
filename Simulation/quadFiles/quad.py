@@ -1,3 +1,4 @@
+import logging
 import pathlib
 
 import numpy as np
@@ -22,6 +23,8 @@ excel_path = pathlib.Path(__file__).parent / "output.xlsx"  # Change this to you
 df = pd.read_excel(excel_path, header=None)  # Assuming no headers
 numerical_data = df.to_numpy()
 upsampled_data = np.repeat(numerical_data, 60, axis=0)
+
+_logger = logging.getLogger("dronesim2.quad")
 
 
 
@@ -292,7 +295,7 @@ class Quadcopter:
             val = 8
         
         
-        print(measured_pressure)
+        _logger.debug("Measured Pressure: %d", measured_pressure)
         # Initialize estimated pressure if it's the first measurement
         if estimated_pressure is None:
             estimated_pressure = measured_pressure
@@ -328,7 +331,7 @@ class Quadcopter:
         #    self.state[2] = 0
             
             
-        print(self.state[2])
+        _logger.debug("Altitude: %d", self.state[2])
         ### Rotor speed from an external source
         
 
