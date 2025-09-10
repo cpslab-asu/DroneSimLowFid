@@ -1,12 +1,15 @@
 import logging
 import pathlib
 
+import cv2
 import numpy as np
 import pandas as pd
 from numpy import sin, cos, tan, pi, sign
 from scipy.integrate import ode
+from scipy.spatial.transform import Rotation
 
 from .. import utils, config
+from ..opticalflow.optical_flow_emulation import CalculateOpticalFlow, SlidingBarAnimation
 from ..utils.EKF import EKF_IMU
 from ..utils import stateConversions as sC
 from ..utils import rotationConversion as rC
@@ -27,6 +30,293 @@ upsampled_data = np.repeat(numerical_data, 60, axis=0)
 _logger = logging.getLogger("dronesim2.quad")
 _logger.addHandler(logging.NullHandler())
 
+"""
+optical_flow_to_velocity.py
+ 
+Pipeline:
+  pixel flow (px/s) -> image angular rates (rad/s) -> remove rotational component
+  -> scale by distance -> rotate to navigation frame (NED or ENU)
+ 
+Conventions (defaults used here):
+  - Body frame (b): x forward, y right, z down (aerospace NED convention).
+  - Camera frame (c): x right, y down, z forward (pinhole camera).
+  - Navigation frame (n): choose NED or ENU via NAV_FRAME constant.
+  - R_cb maps body->camera: v_c = R_cb @ v_b
+  - R_nb maps body->nav:    v_n = R_nb @ v_b  (from your AHRS/EKF)
+  - R_nc = R_nb @ R_bc, with R_bc = R_cb.T
+ 
+Notes:
+  - The small-angle “pure rotation flow” sign mapping used here matches common PX4/ArduPilot conventions:
+      omega_rot_x ~ +omega_cam_y
+      omega_rot_y ~ -omega_cam_x
+    If your sign looks off, flip these two lines.
+"""
+ 
+from dataclasses import dataclass
+import numpy as np
+ 
+# ------------------------
+# Config / Conventions
+# ------------------------
+NAV_FRAME = "NED"  # or "ENU". Only affects how you interpret R_nb from your estimator.
+ 
+# ------------------------
+# Data structures
+# ------------------------
+@dataclass
+class CameraIntrinsics:
+    fx: float  # focal length in pixels along u-axis
+    fy: float  # focal length in pixels along v-axis
+ 
+@dataclass
+class CameraFOV:
+    width_px: int
+    height_px: int
+    fov_x_rad: float  # horizontal FOV in radians
+    fov_y_rad: float  # vertical FOV in radians
+ 
+@dataclass
+class MountAngles:
+    # Camera mount angles relative to BODY axes (roll, pitch, yaw), radians.
+    # These define R_cb = Rz(yaw) @ Ry(pitch) @ Rx(roll)  (body->camera).
+    roll: float
+    pitch: float
+    yaw: float
+ 
+@dataclass
+class FlowMeasurement:
+    du_px_s: float   # optical flow in u (pixels/sec)
+    dv_px_s: float   # optical flow in v (pixels/sec)
+    quality: float = 1.0  # optional quality metric [0..1]
+ 
+@dataclass
+class GyroRates:
+    p: float  # body rate about x_b [rad/s]
+    q: float  # body rate about y_b [rad/s]
+    r: float  # body rate about z_b [rad/s]
+ 
+ 
+# ------------------------
+# Intrinsics helpers
+# ------------------------
+def intrinsics_from_fov(fov: CameraFOV) -> CameraIntrinsics:
+    """
+    Approximate fx,fy from FOV and image size.
+    fx ≈ (W/2) / tan(FOVx/2), fy ≈ (H/2) / tan(FOVy/2)
+    """
+    fx = (fov.width_px / 2.0) / np.tan(fov.fov_x_rad / 2.0)
+    fy = (fov.height_px / 2.0) / np.tan(fov.fov_y_rad / 2.0)
+    return CameraIntrinsics(fx=fx, fy=fy)
+ 
+ 
+# ------------------------
+# Rotation utilities
+# ------------------------
+def R_x(a: float) -> np.ndarray:
+    ca, sa = np.cos(a), np.sin(a)
+    return np.array([[1, 0, 0],
+                     [0, ca, -sa],
+                     [0, sa,  ca]])
+ 
+def R_y(b: float) -> np.ndarray:
+    cb, sb = np.cos(b), np.sin(b)
+    return np.array([[ cb, 0, sb],
+                     [  0, 1,  0],
+                     [-sb, 0, cb]])
+ 
+def R_z(g: float) -> np.ndarray:
+    cg, sg = np.cos(g), np.sin(g)
+    return np.array([[ cg, -sg, 0],
+                     [ sg,  cg, 0],
+                     [  0,   0, 1]])
+ 
+def R_cb_from_mount(angles: MountAngles) -> np.ndarray:
+    """
+    Build camera<-body rotation R_cb using body-fixed roll->pitch->yaw.
+    v_c = R_cb @ v_b
+    """
+    return R_z(angles.yaw) @ R_y(angles.pitch) @ R_x(angles.roll)
+ 
+def is_rotation_matrix(R: np.ndarray, tol: float = 1e-6) -> bool:
+    should_be_I = R @ R.T
+    I = np.eye(3)
+    return np.allclose(should_be_I, I, atol=tol) and np.isclose(np.linalg.det(R), 1.0, atol=1e-6)
+ 
+ 
+# ------------------------
+# Quaternion utilities (body->nav attitude)
+# ------------------------
+def quat_conj(q):
+    w, x, y, z = q
+    return np.array([w, -x, -y, -z])
+ 
+def quat_mul(q1, q2):
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2
+    ])
+ 
+def dcm_from_quat(q):
+    # expects unit quaternion [w, x, y, z]
+    w, x, y, z = q
+    return np.array([
+        [1 - 2*(y*y + z*z),     2*(x*y - w*z),         2*(x*z + w*y)],
+        [2*(x*y + w*z),         1 - 2*(x*x + z*z),     2*(y*z - w*x)],
+        [2*(x*z - w*y),         2*(y*z + w*x),         1 - 2*(x*x + y*y)]
+    ])
+ 
+ 
+# ------------------------
+# Core conversions
+# ------------------------
+def pixel_flow_to_img_rates(flow: FlowMeasurement, K: CameraIntrinsics) -> np.ndarray:
+    """
+    Convert pixel flow (px/s) to angular rates on the image plane (rad/s).
+    Returns [omega_x, omega_y] where:
+      omega_x ~ rotation of sightline about camera y-axis (horizontal sweep)
+      omega_y ~ rotation of sightline about camera x-axis (vertical sweep)
+    """
+    omega_x = flow.du_px_s / K.fx
+    omega_y = flow.dv_px_s / K.fy
+    return np.array([omega_x, omega_y])  # rad/s
+ 
+def body_rates_to_camera(gyro_b: GyroRates, R_cb: np.ndarray) -> np.ndarray:
+    """
+    Map body rates (p,q,r) to camera rates via R_cb (v_c = R_cb v_b).
+    Returns [omega_cam_x, omega_cam_y, omega_cam_z].
+    """
+    w_b = np.array([gyro_b.p, gyro_b.q, gyro_b.r])
+    return R_cb @ w_b
+ 
+def remove_rotational_component(img_rates_xy: np.ndarray, omega_cam_xyz: np.ndarray) -> np.ndarray:
+    """
+    Subtract the rotational image motion predicted from gyro (small-angle model).
+    Using convention:
+      omega_rot_x ≈ +omega_cam_y
+      omega_rot_y ≈ -omega_cam_x
+    Adjust signs if your axes differ.
+    """
+    omega_rot_x = +omega_cam_xyz[1]
+    omega_rot_y = -omega_cam_xyz[0]
+    omega_trans_x = img_rates_xy[0] - omega_rot_x
+    omega_trans_y = img_rates_xy[1] - omega_rot_y
+    return np.array([omega_trans_x, omega_trans_y])
+ 
+def angular_to_camera_velocity(omega_trans_xy: np.ndarray, Z_m: float) -> np.ndarray:
+    """
+    Scale by distance to ground along optical axis (meters) to get linear velocity in camera frame.
+    For nadir-looking small-tilt:
+      V_cam_x ≈ -Z * omega_trans_x
+      V_cam_y ≈ -Z * omega_trans_y
+      V_cam_z ≈ 0 (no info from planar flow)
+    """
+    Vx = -Z_m * omega_trans_xy[0]
+    Vy = -Z_m * omega_trans_xy[1]
+    Vz = 0.0
+    return np.array([Vx, Vy, Vz])  # camera frame
+ 
+def R_nc_from_Rnb_and_Rcb(R_nb: np.ndarray, R_cb: np.ndarray) -> np.ndarray:
+    """
+    R_nc = R_nb @ R_bc, with R_bc = R_cb.T
+    """
+    R_bc = R_cb.T
+    return R_nb @ R_bc
+ 
+def rotate_cam_to_nav(V_cam_xyz: np.ndarray, R_nc: np.ndarray) -> np.ndarray:
+    """
+    V_nav = R_nc @ V_cam
+    """
+    return R_nc @ V_cam_xyz
+ 
+ 
+# ------------------------
+# Convenience: full pipeline
+# ------------------------
+def flow_to_nav_velocity(
+    flow: FlowMeasurement,
+    K: CameraIntrinsics,
+    gyro_b: GyroRates,
+    altitude_m: float,
+    R_nb: np.ndarray,
+    R_cb: np.ndarray
+) -> dict:
+    """
+    Full pipeline from (px/s, gyro, altitude, attitude, mount) to nav velocity.
+ 
+    Returns dict with:
+      {
+        'omega_img_xy_rad_s': [..,..],
+        'omega_cam_xyz_rad_s': [..,..,..],
+        'omega_trans_xy_rad_s': [..,..],
+        'V_cam_m_s': [..,..,..],
+        'V_nav_m_s': [..,..,..]
+      }
+    """
+    assert is_rotation_matrix(R_nb), "R_nb must be a valid rotation matrix"
+    assert is_rotation_matrix(R_cb), "R_cb must be a valid rotation matrix"
+ 
+    omega_img_xy = pixel_flow_to_img_rates(flow, K)                      # rad/s
+    omega_cam_xyz = body_rates_to_camera(gyro_b, R_cb)                   # rad/s
+    omega_trans_xy = remove_rotational_component(omega_img_xy, omega_cam_xyz)
+    V_cam = angular_to_camera_velocity(omega_trans_xy, altitude_m)       # m/s
+    R_nc = R_nc_from_Rnb_and_Rcb(R_nb, R_cb)
+    V_nav = rotate_cam_to_nav(V_cam, R_nc)
+ 
+    return {
+        'omega_img_xy_rad_s': omega_img_xy,
+        'omega_cam_xyz_rad_s': omega_cam_xyz,
+        'omega_trans_xy_rad_s': omega_trans_xy,
+        'V_cam_m_s': V_cam,
+        'V_nav_m_s': V_nav
+    }
+ 
+ 
+# ------------------------
+# Example usage / sanity test
+# ------------------------
+"""
+if __name__ == "__main__":
+    # Example camera: 640x480, 90°x 60° FOV
+    fov = CameraFOV(width_px=640, height_px=480,
+                    fov_x_rad=np.deg2rad(90.0),
+                    fov_y_rad=np.deg2rad(60.0))
+    K = intrinsics_from_fov(fov)
+ 
+    # Flow sample: features moving right 100 px/s and down 40 px/s
+    flow = FlowMeasurement(du_px_s=100.0, dv_px_s=40.0, quality=0.8)
+ 
+    # Gyro: small body rotation (rad/s)
+    gyro = GyroRates(p=np.deg2rad(1.0), q=np.deg2rad(-0.5), r=np.deg2rad(0.0))
+ 
+    # Camera mount: slightly canted; example: roll=0°, pitch=90° (nadir), yaw=180°
+    # (Common for a downward-looking camera aligned with body x forward.)
+    mount = MountAngles(roll=0.0, pitch=np.deg2rad(90.0), yaw=np.deg2rad(180.0))
+    R_cb = R_cb_from_mount(mount)
+    assert is_rotation_matrix(R_cb)
+ 
+    # Attitude: vehicle level, heading north (R_nb ≈ Identity in NED)
+    R_nb = np.eye(3)
+ 
+    # Altitude / range to ground along optical axis (meters)
+    Z = 2.0
+ 
+    out = flow_to_nav_velocity(flow, K, gyro, Z, R_nb, R_cb)
+ 
+    print("fx, fy (px):", K.fx, K.fy)
+    print("omega_img_xy [rad/s]:", out['omega_img_xy_rad_s'])
+    print("omega_cam_xyz [rad/s]:", out['omega_cam_xyz_rad_s'])
+    print("omega_trans_xy [rad/s]:", out['omega_trans_xy_rad_s'])
+    print("V_cam [m/s]:", out['V_cam_m_s'])
+    print("V_nav [m/s]:", out['V_nav_m_s'])
+ 
+    # Quick check: if you spin in place (no translation), flow should be ~pure rotation and
+    # removing rotational component should push V towards ~0.
+    # You can test by setting flow from gyro only and altitude arbitrary; V_nav should be ~0.
+"""
 
 
 class Quadcopter:
@@ -67,6 +357,45 @@ class Quadcopter:
         self.integrator = ode(self.state_dot).set_integrator('dopri5', first_step='0.00005', atol='10e-6', rtol='10e-6')
         self.integrator.set_initial_value(self.state, Ti)
         self.ekf = EKF_IMU(dt=0.005, process_noise=10, measurement_noise=5)
+
+        # Optical Flow
+        # ---------------------------
+        self.optical_flow_prev_vel = np.zeros((3,))
+        self.optical_flow = CalculateOpticalFlow(
+            SlidingBarAnimation(num_rgb_sets=3, frequency=126),
+            lk_params={
+                "winSize": (15, 15),
+                "maxLevel": 2,
+                "criteria": (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
+            },
+            feature_params={
+                "maxCorners": 50,
+                "qualityLevel": 0.3,
+                "minDistance": 5,
+                "blockSize": 5,
+            },
+            visualize=False,
+        )
+        mount = MountAngles(roll=0.0, pitch=np.deg2rad(90.0), yaw=np.deg2rad(180.0))
+        self.R_cb = R_cb_from_mount(mount)
+
+        # Attitude: vehicle level, heading north (R_nb ≈ Identity in NED)
+        # self.R_nb = np.eye(3)
+        # self.R_nb = np.array([
+        #     [0, 0, 0],
+        #     [0, 0, 0],
+        #     [0, 0, 1],
+        # ])
+
+        fov = CameraFOV(
+            width_px=25,
+            height_px=25,
+            fov_x_rad=np.deg2rad(42.0),
+            fov_y_rad=np.deg2rad(42.0),
+        )
+
+        self.K = intrinsics_from_fov(fov)
+
 
 
     def extended_state(self):
@@ -332,7 +661,7 @@ class Quadcopter:
         #    self.state[2] = 0
             
             
-        _logger.debug("Altitude: %.4f", self.state[2])
+        _logger.debug("Simulation time: %.2f, Altitude: %.4f", t, self.state[2])
         ### Rotor speed from an external source
         
 
@@ -358,9 +687,33 @@ class Quadcopter:
         #print("First Values:" )
         #print([p, q, r])
         self.ekf.predict([p, q, r])
+        self.optical_flow.step(Ts)
+     
+        # Altitude / range to ground along optical axis (meters)
+        Z = self.state[2]
+
+        flow = FlowMeasurement(
+            self.optical_flow.x_pixel_flow,
+            self.optical_flow.y_pixel_flow,
+            quality=1.0,
+        )
+
+        _logger.debug("Optical flow pixel flow reported: < %.6f, %.6f >", flow.du_px_s, flow.dv_px_s)
+
+        # Create rotation matrix from current drone orientation
+        rot = Rotation.from_quat(self.state[3:7])
+        R_nb = rot.as_matrix()
+     
+        out = flow_to_nav_velocity(flow, self.K, GyroRates(p, q, r), Z, R_nb, self.R_cb)
+        opticalflow_vel = out['V_nav_m_s']
+        opticalflow_acc = (opticalflow_vel - self.optical_flow_prev_vel) / Ts  
+
+        _logger.debug("Optical flow velocities reported: < %.6f, %.6f >", opticalflow_vel[0], opticalflow_vel[1])
+
+        accel = sC.accelerometer_readings(self.acc[0], self.acc[1], self.acc[2], self.state[3], self.state[4], self.state[5], self.state[6])
+        accel[0:2] = opticalflow_acc[0:2]  # Overwrite accelerometer acceleration values with acceleration computed from optical flow
         
-        accel = sC.accelerometer_readings(self.acc[0], self.acc[1], self.acc[2], self.state[3], self.state[4], self.state[5], self.state[6] )
-        
+        self.optical_flow_prev_vel = opticalflow_vel
         self.ekf.update(accel,[0, 0, 0])
         
         roll, pitch, yaw = self.ekf.get_orientation()
